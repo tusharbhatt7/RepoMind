@@ -1,0 +1,58 @@
+# Render service definition for the repomind FastAPI + Inngest backend.
+# Free tier: 512 MB RAM, sleeps after 15 min idle (~30s cold start on next hit).
+# ChromaDB lives in the container's ephemeral filesystem on the free plan — it
+# resets on every redeploy, so re-ingest repos after each deploy.
+# (Upgrade to a paid plan + persistent disk if you need durable vectors.)
+
+services:
+  - type: web
+    name: repomind-backend
+    runtime: python
+    plan: free
+    region: oregon                # closest to most users; change if needed
+    branch: main
+    rootDir: .
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    autoDeploy: true              # redeploy on push to main
+    healthCheckPath: /api/collections
+    envVars:
+      # Pinned to the venv that exists on disk (Python 3.12.x recommended; 3.13/3.14 fine too).
+      - key: PYTHON_VERSION
+        value: "3.12"
+
+      # ── Modal endpoints (already deployed via ../rag-learning/qwen_modal.py) ──
+      # Paste these values in Render's UI → Environment → Add Environment Variable.
+      # Do NOT commit secrets to this file.
+      - key: VLLM_API_KEY
+        sync: false
+      - key: VLLM_BASE_URL
+        sync: false
+      - key: VLLM_MODEL
+        value: "Qwen/Qwen2.5-7B-Instruct"
+      - key: QWEN_GENERATE_URL
+        sync: false               # rag-learning's /generate endpoint
+      - key: EMBED_BASE_URL
+        sync: false               # rag-learning's /v1 endpoint (must end with /v1)
+      - key: EMBED_MODEL
+        value: "BAAI/bge-small-en-v1.5"
+
+      # ── GitHub PAT (repo:read scope) ────────────────────────────────────
+      - key: GITHUB_TOKEN
+        sync: false
+
+      # ── Inngest Cloud signing keys ──────────────────────────────────────
+      # From https://app.inngest.com → your app → Manage → Signing Keys.
+      - key: INNGEST_EVENT_KEY
+        sync: false
+      - key: INNGEST_SIGNING_KEY
+        sync: false
+
+      # ── Cross-origin: set this to your Vercel frontend URL after deploy ──
+      # e.g. "https://repomind.vercel.app" (comma-separated for multiple).
+      - key: CORS_ORIGINS
+        sync: false
+
+      # ── Optional: override ChromaDB location (default ./chroma_db) ──────
+      # - key: CHROMA_DB_PATH
+      #   value: "/opt/render/project/src/chroma_db"

@@ -1,0 +1,355 @@
+"""Agent tools: vector search, file fetch, recent commits.
+
+Each tool returns a string formatted for the LLM to read. The agent
+reaches the ingested index and the live GitHub repo through these
+tools — all retrieval is tool-call mediated (see CLAUDE.md).
+
+Usage (smoke test):
+    python tools.py <collection_name>
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from contextvars import ContextVar
+from itertools import islice
+
+import chromadb
+import openai
+from dotenv import load_dotenv
+from github import Auth, Github
+
+load_dotenv()
+
+CHROMA_PATH = os.getenv("CHROMA_DB_PATH", "./chroma_db")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "BAAI/bge-small-en-v1.5")
+
+MAX_FILE_CHARS = 3000
+VALID_FILTER_TYPES = {"function", "class", "doc", "code"}
+
+# Per-call latency metrics stored in a ContextVar so concurrent calls (async
+# server + Streamlit thread) never race on a shared module-level dict.
+# agent.py reads this after run_tool() returns and merges it into the log entry.
+_TOOL_METRICS: ContextVar[dict] = ContextVar("_TOOL_METRICS", default={})
+
+
+def _parse_owner_repo(collection_name: str) -> tuple[str, str]:
+    """Extract (owner, repo) from a collection name.
+
+    Accepts the bare form ``{owner}_{name}_{mode}`` or the qualified form
+    ``{tenant}__{owner}_{name}_{mode}__{embed_provider}``. Both wrapper layers
+    are stripped first so PyGithub gets the raw owner/repo.
+    """
+    from auth import strip_collection
+    _, bare, _ = strip_collection(collection_name)
+    without_mode = bare.rsplit("_", 1)[0]
+    owner, _, repo = without_mode.partition("_")
+    if not owner or not repo:
+        raise ValueError(
+            f"Cannot parse owner/repo from collection_name {collection_name!r}"
+        )
+    return owner, repo
+
+
+def _get_repo(collection_name: str):
+    # ContextVar override (e.g. PAT pasted in the dashboard Settings page) wins,
+    # env-var GITHUB_TOKEN is the fallback. See auth.py.
+    from auth import get_github_token
+    owner, repo = _parse_owner_repo(collection_name)
+    gh = Github(auth=Auth.Token(get_github_token()))
+    return gh.get_repo(f"{owner}/{repo}")
+
+
+def _embed(text: str) -> list[float]:
+    """Embed a query string using the active embed provider.
+
+    Delegates to ingest.embed() which switches on provider (vllm/openai/gemini).
+    Provider-specific model defaults are resolved inside that call — we keep
+    EMBED_MODEL as a back-compat hint but it's only used when provider=vllm AND
+    no per-request override is set.
+    """
+    from ingest import embed as _provider_embed
+    t0 = time.time()
+    vec = _provider_embed(text)
+    _TOOL_METRICS.set({**_TOOL_METRICS.get({}), "embed_ms": round((time.time() - t0) * 1000)})
+    return vec
+
+
+def vector_search(
+    query: str,
+    collection_name: str,
+    filter_type: str | None = None,
+    n_results: int = 5,
+) -> str:
+    """Semantic search over the ingested collection. Use FIRST for code/doc questions."""
+    if filter_type is not None and filter_type not in VALID_FILTER_TYPES:
+        return (
+            f"Error: filter_type must be one of {sorted(VALID_FILTER_TYPES)}; "
+            f"got {filter_type!r}."
+        )
+
+    client = chromadb.PersistentClient(path=CHROMA_PATH)
+    try:
+        collection = client.get_collection(collection_name)
+    except Exception as e:
+        return f"Error: collection {collection_name!r} not found ({e})."
+
+    query_vec = _embed(query)
+
+    kwargs: dict = {
+        "query_embeddings": [query_vec],
+        "n_results": n_results,
+        "include": ["documents", "metadatas", "distances"],
+    }
+    if filter_type:
+        kwargs["where"] = {"type": filter_type}
+
+    t1 = time.time()
+    results = collection.query(**kwargs)
+    _TOOL_METRICS.set({**_TOOL_METRICS.get({}), "chroma_ms": round((time.time() - t1) * 1000)})
+    ids = results.get("ids", [[]])[0]
+    docs = results.get("documents", [[]])[0]
+    metas = results.get("metadatas", [[]])[0]
+
+    if not ids:
+        return f"No results for query {query!r}."
+
+    # --- sibling-part expansion -------------------------------------------
+    # If any result is a sub-chunk (has a "part" metadata field), fetch ALL
+    # sibling parts of that function so the LLM sees the complete body.
+    # We identify siblings by the shared base_id (chunk_id without ::partN).
+    seen_ids = set(ids)
+    extra_docs: list[str] = []
+    extra_metas: list[dict] = []
+
+    for chunk_id, meta in zip(ids, metas):
+        if meta and meta.get("part") is not None:
+            # base_id is everything before ::partN
+            base_id = chunk_id.rsplit("::part", 1)[0]
+            # Fetch all chunks whose id starts with base_id
+            try:
+                siblings = collection.get(
+                    where={"$and": [
+                        {"type":      {"$eq": meta["type"]}},
+                        {"name":      {"$eq": meta["name"]}},
+                        {"file_path": {"$eq": meta["file_path"]}},
+                        {"line_start":{"$eq": meta["line_start"]}},
+                    ]},
+                    include=["documents", "metadatas"],
+                )
+                for sib_id, sib_doc, sib_meta in zip(
+                    siblings["ids"], siblings["documents"], siblings["metadatas"]
+                ):
+                    if sib_id not in seen_ids:
+                        seen_ids.add(sib_id)
+                        extra_docs.append(sib_doc)
+                        extra_metas.append(sib_meta or {})
+            except Exception:
+                pass  # sibling fetch is best-effort
+
+    # Merge: original results first, then any newly fetched siblings
+    all_docs   = docs   + extra_docs
+    all_metas  = metas  + extra_metas
+    # ----------------------------------------------------------------------
+
+    total = len(ids) + len(extra_docs)
+    sibling_note = f" (+{len(extra_docs)} sibling parts)" if extra_docs else ""
+    lines = [f"Found {len(ids)} results{sibling_note}:", ""]
+
+    for i, (doc, meta) in enumerate(zip(all_docs, all_metas), start=1):
+        meta = meta or {}
+        kind = meta.get("type", "chunk")
+        file_path = meta.get("file_path", "?")
+        name = meta.get("name")
+        line_start = meta.get("line_start")
+        line_end = meta.get("line_end")
+        heading = meta.get("heading")
+        part = meta.get("part")
+        docstring = meta.get("docstring", "")
+
+        if kind in ("function", "class") and name and line_start and line_end:
+            part_note = f" [part {part}]" if part is not None else ""
+            header = (
+                f"[{i}] {kind} `{name}` in {file_path} "
+                f"(lines {line_start}-{line_end}){part_note}"
+            )
+            if docstring and part:
+                header += f"\n    Docstring: {docstring[:200]}"
+        elif kind == "doc" and heading:
+            header = f"[{i}] doc '{heading}' in {file_path}"
+        else:
+            header = f"[{i}] {kind} in {file_path}"
+
+        lines.append(header)
+        lines.append(doc)
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def get_file(collection_name: str, file_path: str) -> str:
+    """Fetch raw file content from the repo tied to this collection."""
+    try:
+        repo = _get_repo(collection_name)
+    except (ValueError, RuntimeError) as e:
+        return f"Error: {e}"
+
+    try:
+        entry = repo.get_contents(file_path)
+    except Exception as e:
+        return f"Error: could not fetch {file_path!r}: {e}"
+
+    if isinstance(entry, list):
+        return f"Error: {file_path!r} is a directory, not a file."
+
+    try:
+        text = entry.decoded_content.decode("utf-8")
+    except (UnicodeDecodeError, AssertionError) as e:
+        return f"Error: could not decode {file_path!r}: {e}"
+
+    header = f"File: {file_path}\n{'=' * (6 + len(file_path))}\n"
+    if len(text) > MAX_FILE_CHARS:
+        return header + text[:MAX_FILE_CHARS] + "\n... [truncated]"
+    return header + text
+
+
+def get_recent_commits(collection_name: str, n: int = 5) -> str:
+    """Return the last `n` commits of the repo tied to this collection."""
+    try:
+        repo = _get_repo(collection_name)
+    except (ValueError, RuntimeError) as e:
+        return f"Error: {e}"
+
+    try:
+        commits = list(islice(repo.get_commits(), n))
+    except Exception as e:
+        return f"Error: could not fetch commits: {e}"
+
+    if not commits:
+        return "No commits found."
+
+    lines = [f"Last {len(commits)} commits:"]
+    for c in commits:
+        sha = c.sha[:7]
+        author = c.commit.author.name if c.commit.author else "unknown"
+        date = (
+            c.commit.author.date.strftime("%Y-%m-%d")
+            if c.commit.author and c.commit.author.date
+            else "?"
+        )
+        subject = c.commit.message.splitlines()[0] if c.commit.message else ""
+        lines.append(f"- {sha} ({date} by {author}): {subject}")
+    return "\n".join(lines)
+
+
+TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "vector_search",
+            "description": (
+                "Search the indexed codebase semantically. Use this FIRST "
+                "for any question about code or docs."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query — use technical keywords",
+                    },
+                    "filter_type": {
+                        "type": "string",
+                        "enum": ["function", "class", "doc", "code"],
+                        "description": "Optional: filter to a specific chunk type",
+                    },
+                    "n_results": {
+                        "type": "integer",
+                        "description": "Number of results",
+                        "default": 5,
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_file",
+            "description": "Fetch the full contents of a specific file from the repo.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to the file, e.g. 'src/auth/service.py'",
+                    },
+                },
+                "required": ["file_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_recent_commits",
+            "description": "Get the last N commits from the repo.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "n": {
+                        "type": "integer",
+                        "description": "Number of commits",
+                        "default": 5,
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+]
+
+
+_TOOL_DISPATCH = {
+    "vector_search": vector_search,
+    "get_file": get_file,
+    "get_recent_commits": get_recent_commits,
+}
+
+
+def run_tool(tool_name: str, args: dict, collection_name: str) -> str:
+    """Dispatch a tool call from the agent loop. Returns a string result."""
+    fn = _TOOL_DISPATCH.get(tool_name)
+    if fn is None:
+        return f"Error: unknown tool {tool_name!r}."
+    try:
+        return fn(collection_name=collection_name, **args)
+    except TypeError as e:
+        return f"Error: bad arguments to {tool_name}: {e}"
+
+
+def _smoke_test(collection_name: str) -> None:
+    print(f"=== vector_search('main entry point', {collection_name!r}) ===")
+    print(vector_search("main entry point", collection_name))
+
+    print(f"\n=== vector_search(..., filter_type='function') ===")
+    print(vector_search("initialize the client", collection_name, filter_type="function"))
+
+    print(f"\n=== get_recent_commits({collection_name!r}, n=3) ===")
+    print(get_recent_commits(collection_name, n=3))
+
+    print(f"\n=== run_tool('get_recent_commits', {{'n': 2}}, ...) ===")
+    print(run_tool("get_recent_commits", {"n": 2}, collection_name))
+
+    print(f"\n=== TOOL_SCHEMAS ({len(TOOL_SCHEMAS)} tools) ===")
+    print(json.dumps([s["function"]["name"] for s in TOOL_SCHEMAS], indent=2))
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        print("Usage: python tools.py <collection_name>", file=sys.stderr)
+        sys.exit(2)
+    _smoke_test(sys.argv[1])

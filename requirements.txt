@@ -1,0 +1,11 @@
+openai
+chromadb
+PyGithub
+streamlit
+python-dotenv
+pandas
+inngest>=0.5.18
+fastapi>=0.136.1
+uvicorn[standard]>=0.46.0
+httpx
+tree-sitter-language-pack>=1.8.0
