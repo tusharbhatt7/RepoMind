@@ -567,6 +567,12 @@ _RETRY_STATUSES = {429, 500, 502, 503, 504}
 # body and a longer single HTTP call, which is what makes a read timeout likely.
 _EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "32"))
 
+# Pause between batches. Backing off *after* a 429 still spends the failed
+# request against the quota; a small deliberate gap keeps request rate under the
+# per-minute ceiling instead of repeatedly discovering it. Costs ~10 s on a
+# 330-chunk repo, far less than one exhausted backoff cycle.
+_EMBED_BATCH_PAUSE = float(os.getenv("EMBED_BATCH_PAUSE", "1.0"))
+
 
 def _status_of(exc: Exception) -> int | None:
     """Pull an HTTP status off an httpx or openai-SDK exception, if present."""
@@ -587,6 +593,23 @@ def _is_retryable(exc: Exception) -> bool:
     return isinstance(exc, (httpx.TimeoutException, httpx.TransportError))
 
 
+def _error_body(exc: Exception) -> str:
+    """First 300 chars of an error response body.
+
+    raise_for_status() only reports the status line, so Google's actual quota
+    detail ("per minute" vs "per day", and its suggested retryDelay) never
+    reached the logs — which is the one thing needed to tell a transient
+    rate-limit apart from an exhausted daily allowance.
+    """
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return ""
+    try:
+        return f" | body: {resp.text[:300]}"
+    except Exception:
+        return ""
+
+
 def _retry_after(exc: Exception) -> float | None:
     """Honour a server-supplied Retry-After header when there is one."""
     resp = getattr(exc, "response", None)
@@ -597,8 +620,14 @@ def _retry_after(exc: Exception) -> float | None:
         return None
 
 
-def _with_retry(fn, *, what: str, attempts: int = 5):
-    """Call ``fn``, retrying transient/rate-limit failures with exponential backoff."""
+def _with_retry(fn, *, what: str, attempts: int = 8):
+    """Call ``fn``, retrying transient/rate-limit failures with exponential backoff.
+
+    8 attempts with backoff capped at 90 s (~4 min total). The cap matters: a
+    per-minute quota only clears once its 60 s window rolls over, so a backoff
+    that tops out below 60 s can never outlast the very limit it's retrying
+    against — it just burns its attempts and fails.
+    """
     for attempt in range(attempts):
         try:
             return fn()
@@ -608,11 +637,12 @@ def _with_retry(fn, *, what: str, attempts: int = 5):
             detail = f"HTTP {_status_of(e)}" if _status_of(e) else type(e).__name__
             if not _is_retryable(e) or attempt == attempts - 1:
                 print(
-                    f"[error] {what} failed permanently ({detail}): {e}",
+                    f"[error] {what} failed permanently ({detail}): {e}"
+                    f"{_error_body(e)}",
                     flush=True,
                 )
                 raise
-            wait = _retry_after(e) or min(2.0 * (2**attempt), 60.0)
+            wait = _retry_after(e) or min(2.0 * (2**attempt), 90.0)
             print(
                 f"[retry] {what} hit {detail}; sleeping {wait:.0f}s "
                 f"(attempt {attempt + 1}/{attempts})",
@@ -826,6 +856,8 @@ def embed_and_store_chunks(chunks_data: dict) -> dict:
                 if len(batch) >= _EMBED_BATCH_SIZE:
                     _flush(batch)
                     batch = []
+                    if _EMBED_BATCH_PAUSE > 0:
+                        time.sleep(_EMBED_BATCH_PAUSE)
             _flush(batch)
     except Exception:
         # Deliberately do NOT delete the chunk file here. Inngest memoizes the
