@@ -1,0 +1,16 @@
+# Server-only dependencies — what Render actually needs to run `server:app`.
+#
+# requirements.txt is the full local/dev set and additionally pulls in
+# streamlit + pandas for the legacy Streamlit UI (app.py), which the FastAPI
+# deployment never imports. Keeping them out here trims build time and RSS on
+# Render's 512 MB free instance.
+
+openai
+chromadb
+PyGithub
+python-dotenv
+inngest>=0.5.18
+fastapi>=0.136.1
+uvicorn[standard]>=0.46.0
+httpx
+tree-sitter-language-pack>=1.8.0

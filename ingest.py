@@ -553,6 +553,113 @@ def _embed_gemini(text: str, model: str, key: str) -> list[float]:
     return data["embedding"]["values"]
 
 
+# ─── Rate-limit-tolerant batch embedding ────────────────────────────────────
+# Hosted embedding APIs (especially Gemini's free tier) rate-limit hard. One
+# HTTP call per chunk both burns quota and takes minutes on a real repo, so we
+# batch where the provider supports it and back off on 429 rather than dropping
+# chunks — a silently half-embedded collection makes the agent answer
+# confidently from a partial index, which is worse than a failed ingest.
+
+_RETRY_STATUSES = {429, 500, 502, 503, 504}
+_EMBED_BATCH_SIZE = 64
+
+
+def _status_of(exc: Exception) -> int | None:
+    """Pull an HTTP status off an httpx or openai-SDK exception, if present."""
+    resp = getattr(exc, "response", None)
+    return getattr(resp, "status_code", None) or getattr(exc, "status_code", None)
+
+
+def _retry_after(exc: Exception) -> float | None:
+    """Honour a server-supplied Retry-After header when there is one."""
+    resp = getattr(exc, "response", None)
+    raw = getattr(resp, "headers", {}).get("Retry-After") if resp is not None else None
+    try:
+        return float(raw) if raw else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _with_retry(fn, *, what: str, attempts: int = 5):
+    """Call ``fn``, retrying transient/rate-limit failures with exponential backoff."""
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            status = _status_of(e)
+            if status not in _RETRY_STATUSES or attempt == attempts - 1:
+                raise
+            wait = _retry_after(e) or min(2.0 * (2**attempt), 60.0)
+            print(
+                f"[retry] {what} got HTTP {status}; sleeping {wait:.0f}s "
+                f"(attempt {attempt + 1}/{attempts})",
+                flush=True,
+            )
+            time.sleep(wait)
+
+
+def embed_many(texts: list[str]) -> list[list[float]]:
+    """Embed a list of texts, using the provider's batch endpoint where possible.
+
+    Falls back to per-text embedding if the batch call fails for a non-transient
+    reason (some model versions only accept a single input per request).
+    """
+    from auth import get_embed_api_key, get_embed_model, get_embed_provider, get_vllm_api_key
+
+    if not texts:
+        return []
+
+    provider = get_embed_provider()
+    model = get_embed_model(provider)
+
+    try:
+        if provider in ("vllm", "openai"):
+            base = "https://api.openai.com/v1" if provider == "openai" else os.getenv("EMBED_BASE_URL")
+            key = get_embed_api_key() if provider == "openai" else get_vllm_api_key()
+            client = openai.OpenAI(base_url=base, api_key=key)
+            resp = _with_retry(
+                lambda: client.embeddings.create(input=texts, model=model),
+                what=f"{provider} embeddings",
+            )
+            return [d.embedding for d in sorted(resp.data, key=lambda d: d.index)]
+        if provider == "gemini":
+            return _embed_gemini_batch(texts, model, get_embed_api_key())
+    except Exception as e:
+        if _status_of(e) in _RETRY_STATUSES:
+            raise  # exhausted retries — a real outage, don't paper over it
+        print(f"[warn] Batch embed failed ({e}); falling back to per-chunk.", flush=True)
+
+    return [_with_retry(lambda t=t: embed(t), what="embedding") for t in texts]
+
+
+def _embed_gemini_batch(texts: list[str], model: str, key: str) -> list[list[float]]:
+    """Gemini ``batchEmbedContents`` — up to 100 texts per call."""
+    if not key:
+        raise RuntimeError(
+            "No Gemini API key. Set LLM_API_KEY/EMBED_API_KEY on the server, or "
+            "paste one in the dashboard's Settings → Embeddings card."
+        )
+    import httpx
+
+    def _call():
+        resp = httpx.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:batchEmbedContents",
+            headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+            json={
+                "requests": [
+                    {"model": f"models/{model}", "content": {"parts": [{"text": t}]}}
+                    for t in texts
+                ]
+            },
+            timeout=120.0,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    data = _with_retry(_call, what="gemini batchEmbedContents")
+    return [e["values"] for e in data["embeddings"]]
+
+
 def fetch_and_chunk_repo(
     repo_slug: str,
     mode: str,
@@ -652,7 +759,33 @@ def embed_and_store_chunks(chunks_data: dict) -> dict:
 
     total = 0
     errors = 0
+
+    def _flush(batch: list[dict]) -> None:
+        """Embed + upsert one batch. Raises rather than skipping on failure."""
+        nonlocal total
+        if not batch:
+            return
+        try:
+            vectors = embed_many([c["text"] for c in batch])
+        except Exception as e:
+            # Deliberately fatal: a collection missing an arbitrary subset of its
+            # chunks still answers queries, just wrongly. Fail the Inngest step so
+            # it retries instead of publishing a silently incomplete index.
+            raise RuntimeError(
+                f"Embedding failed after retries at chunk {total} of "
+                f"'{collection_name}' — aborting to avoid a partial index: {e}"
+            ) from e
+        collection.upsert(
+            ids=[c["id"] for c in batch],
+            documents=[c["text"] for c in batch],
+            embeddings=vectors,
+            metadatas=[c["metadata"] for c in batch],
+        )
+        total += len(batch)
+        print(f"[progress] {total} chunks embedded", flush=True)
+
     try:
+        batch: list[dict] = []
         with open(temp_path, encoding="utf-8") as f:
             for line in f:
                 if is_ingest_cancelled(collection_name):
@@ -662,22 +795,11 @@ def embed_and_store_chunks(chunks_data: dict) -> dict:
                 line = line.strip()
                 if not line:
                     continue
-                chunk = json.loads(line)
-                try:
-                    vec = embed(chunk["text"])
-                except Exception as e:
-                    print(f"[warn] Embedding failed for {chunk['id']}: {e}", flush=True)
-                    errors += 1
-                    continue
-                collection.upsert(
-                    ids=[chunk["id"]],
-                    documents=[chunk["text"]],
-                    embeddings=[vec],
-                    metadatas=[chunk["metadata"]],
-                )
-                total += 1
-                if total % 50 == 0:
-                    print(f"[progress] {total} chunks embedded", flush=True)
+                batch.append(json.loads(line))
+                if len(batch) >= _EMBED_BATCH_SIZE:
+                    _flush(batch)
+                    batch = []
+            _flush(batch)
     finally:
         # Only delete if the file exists — safe for retries (retry re-runs
         # fetch-and-chunk first, which recreates the file before this step).

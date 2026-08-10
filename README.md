@@ -11,14 +11,14 @@ Ask plain-English questions about any GitHub repo and get answers grounded in th
 
 | Layer | Default | Override per user |
 |---|---|---|
-| **Text generation** | Qwen2.5-7B on Modal (custom `/generate`) | OpenAI / Gemini via Settings → X-LLM-* headers |
-| **Embeddings** | bge-small-en-v1.5 (384d) on Modal | OpenAI `text-embedding-3-small` (1536d) / Gemini `gemini-embedding-001` (3072d) |
+| **Text generation** | `gemini-2.5-flash` on the hosted demo; self-hosted Qwen2.5-7B on Modal (custom `/generate`) when `LLM_PROVIDER=vllm` | OpenAI / Gemini via Settings → X-LLM-* headers |
+| **Embeddings** | `gemini-embedding-001` (3072d) hosted; bge-small-en-v1.5 (384d) on Modal when `EMBED_PROVIDER=vllm` | OpenAI `text-embedding-3-small` (1536d) / Gemini `gemini-embedding-001` (3072d) |
 | **Code chunking** | Python `ast` for `.py`; **tree-sitter cAST** for 306+ other languages; H2-headings for `.md`; naive sliding-window as fallback | — |
 | **Agent loop** | Text-based ReAct (parses `Action:` / `Action Input:`) | — |
 | **Vector DB** | ChromaDB persistent client (`./chroma_db`) | — |
 | **Backend** | FastAPI + [Inngest](https://www.inngest.com) durable jobs | — |
 | **Frontend** | Next.js (App Router) | — |
-| **Production hosts** | Vercel + Render + Inngest Cloud + Modal | — |
+| **Production hosts** | Vercel (frontend) + Render (API) + Inngest Cloud (jobs) + Gemini API | — |
 
 No LangChain. No LlamaIndex.
 

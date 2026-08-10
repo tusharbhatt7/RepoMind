@@ -135,9 +135,20 @@ def set_llm_provider_override(provider: str | None) -> None:
     _llm_provider_override.set(p if p in SUPPORTED_PROVIDERS else None)
 
 
+def _env_provider(var: str, supported: tuple[str, ...]) -> str:
+    """Read a deploy-level default provider from the environment.
+
+    Lets a deployment pick its own default (e.g. LLM_PROVIDER=gemini on Render)
+    instead of hardwiring Modal. Unrecognised values fall back to ``vllm`` so a
+    typo degrades to the historical default rather than crashing every request.
+    """
+    p = os.getenv(var, "").strip().lower()
+    return p if p in supported else "vllm"
+
+
 def get_llm_provider() -> str:
-    """Return the active text-generation provider — override first, ``vllm`` otherwise."""
-    return _llm_provider_override.get() or "vllm"
+    """Active text-generation provider — per-request override, then env, then ``vllm``."""
+    return _llm_provider_override.get() or _env_provider("LLM_PROVIDER", SUPPORTED_PROVIDERS)
 
 
 def set_llm_api_key_override(key: str | None) -> None:
@@ -148,10 +159,11 @@ def set_llm_api_key_override(key: str | None) -> None:
 def get_llm_api_key() -> str:
     """Provider-specific key for Anthropic / OpenAI / Gemini.
 
-    Returns "" if unset — caller should raise a helpful error pointing the user
-    to Settings before making the HTTP call.
+    Falls back to the deploy's own LLM_API_KEY so a visitor who never opens
+    Settings still gets a working app. Returns "" if neither is set — caller
+    raises a helpful error pointing the user to Settings.
     """
-    return _llm_api_key_override.get() or ""
+    return _llm_api_key_override.get() or os.getenv("LLM_API_KEY", "").strip()
 
 
 def set_llm_model_override(model: str | None) -> None:
@@ -189,8 +201,10 @@ def set_embed_provider_override(provider: str | None) -> None:
 
 
 def get_embed_provider() -> str:
-    """Active embedding provider — override first, falls back to ``vllm``."""
-    return _embed_provider_override.get() or "vllm"
+    """Active embedding provider — per-request override, then env, then ``vllm``."""
+    return _embed_provider_override.get() or _env_provider(
+        "EMBED_PROVIDER", SUPPORTED_EMBED_PROVIDERS
+    )
 
 
 def set_embed_api_key_override(key: str | None) -> None:
@@ -198,8 +212,16 @@ def set_embed_api_key_override(key: str | None) -> None:
 
 
 def get_embed_api_key() -> str:
-    """Key for OpenAI / Gemini embeddings. For vllm, use get_vllm_api_key()."""
-    return _embed_api_key_override.get() or ""
+    """Key for OpenAI / Gemini embeddings. For vllm, use get_vllm_api_key().
+
+    Falls back to the deploy's EMBED_API_KEY, then LLM_API_KEY — the common case
+    is one Gemini key serving both text-gen and embeddings.
+    """
+    return (
+        _embed_api_key_override.get()
+        or os.getenv("EMBED_API_KEY", "").strip()
+        or os.getenv("LLM_API_KEY", "").strip()
+    )
 
 
 def set_embed_model_override(model: str | None) -> None:
