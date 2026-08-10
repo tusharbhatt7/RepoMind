@@ -109,6 +109,21 @@ def _generate_openai(prompt: str, max_new_tokens: int, temperature: float, key: 
 def _generate_gemini(prompt: str, max_new_tokens: int, temperature: float, key: str, model: str) -> str:
     """Google Gemini ``generateContent`` — key sent as ``x-goog-api-key`` header."""
     _require_key("Gemini", key)
+    generation_config: dict = {
+        "maxOutputTokens": max_new_tokens,
+        "temperature": temperature,
+    }
+    # Gemini 2.5 models think before answering, and those thinking tokens count
+    # against maxOutputTokens. At a small budget thinking eats the whole
+    # allowance and the visible text comes back truncated — query_rewrite asks
+    # for 100 tokens and was returning the fragment 'Rewrite: "'.
+    #
+    # Disable it: this agent wants literal ReAct output (Action: / Action Input:),
+    # not deliberation, and turning it off cuts latency and cost too. Only Flash
+    # and Flash-Lite accept a zero budget; Pro rejects it, so leave Pro alone.
+    if "2.5" in model and "pro" not in model.lower():
+        generation_config["thinkingConfig"] = {"thinkingBudget": 0}
+
     resp = httpx.post(
         f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
         headers={
@@ -117,10 +132,7 @@ def _generate_gemini(prompt: str, max_new_tokens: int, temperature: float, key: 
         },
         json={
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "maxOutputTokens": max_new_tokens,
-                "temperature": temperature,
-            },
+            "generationConfig": generation_config,
         },
         timeout=120.0,
     )
