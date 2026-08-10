@@ -2,7 +2,7 @@
 
 Each tool returns a string formatted for the LLM to read. The agent
 reaches the ingested index and the live GitHub repo through these
-tools — all retrieval is tool-call mediated (see CLAUDE.md).
+tools — all retrieval is tool-call mediated (see docs/ARCHITECTURE.md).
 
 Usage (smoke test):
     python tools.py <collection_name>
