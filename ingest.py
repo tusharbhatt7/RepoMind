@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Iterable
 
 import chromadb
+import httpx
 import openai
 from dotenv import load_dotenv
 
@@ -561,13 +562,29 @@ def _embed_gemini(text: str, model: str, key: str) -> list[float]:
 # confidently from a partial index, which is worse than a failed ingest.
 
 _RETRY_STATUSES = {429, 500, 502, 503, 504}
-_EMBED_BATCH_SIZE = 64
+
+# 32, not 64: on a 512 MB Render instance a larger batch means a bigger request
+# body and a longer single HTTP call, which is what makes a read timeout likely.
+_EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "32"))
 
 
 def _status_of(exc: Exception) -> int | None:
     """Pull an HTTP status off an httpx or openai-SDK exception, if present."""
     resp = getattr(exc, "response", None)
     return getattr(resp, "status_code", None) or getattr(exc, "status_code", None)
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """Whether a failed embedding call is worth retrying.
+
+    Covers both rate-limit/5xx responses and transport-level failures. Timeouts
+    and dropped connections have no HTTP status at all, so a status-only check
+    treats them as permanent — which is exactly backwards, since they're the
+    most transient failures there are.
+    """
+    if _status_of(exc) in _RETRY_STATUSES:
+        return True
+    return isinstance(exc, (httpx.TimeoutException, httpx.TransportError))
 
 
 def _retry_after(exc: Exception) -> float | None:
@@ -586,12 +603,18 @@ def _with_retry(fn, *, what: str, attempts: int = 5):
         try:
             return fn()
         except Exception as e:
-            status = _status_of(e)
-            if status not in _RETRY_STATUSES or attempt == attempts - 1:
+            # Always say what actually went wrong — a bare "embedding failed" in
+            # the logs is what made the first production failure undiagnosable.
+            detail = f"HTTP {_status_of(e)}" if _status_of(e) else type(e).__name__
+            if not _is_retryable(e) or attempt == attempts - 1:
+                print(
+                    f"[error] {what} failed permanently ({detail}): {e}",
+                    flush=True,
+                )
                 raise
             wait = _retry_after(e) or min(2.0 * (2**attempt), 60.0)
             print(
-                f"[retry] {what} got HTTP {status}; sleeping {wait:.0f}s "
+                f"[retry] {what} hit {detail}; sleeping {wait:.0f}s "
                 f"(attempt {attempt + 1}/{attempts})",
                 flush=True,
             )
@@ -625,9 +648,13 @@ def embed_many(texts: list[str]) -> list[list[float]]:
         if provider == "gemini":
             return _embed_gemini_batch(texts, model, get_embed_api_key())
     except Exception as e:
-        if _status_of(e) in _RETRY_STATUSES:
+        if _is_retryable(e):
             raise  # exhausted retries — a real outage, don't paper over it
-        print(f"[warn] Batch embed failed ({e}); falling back to per-chunk.", flush=True)
+        print(
+            f"[warn] Batch embed failed ({type(e).__name__}: {e}); "
+            f"falling back to per-chunk.",
+            flush=True,
+        )
 
     return [_with_retry(lambda t=t: embed(t), what="embedding") for t in texts]
 
@@ -800,9 +827,15 @@ def embed_and_store_chunks(chunks_data: dict) -> dict:
                     _flush(batch)
                     batch = []
             _flush(batch)
-    finally:
-        # Only delete if the file exists — safe for retries (retry re-runs
-        # fetch-and-chunk first, which recreates the file before this step).
+    except Exception:
+        # Deliberately do NOT delete the chunk file here. Inngest memoizes the
+        # completed fetch-and-chunk step, so a retry of *this* step replays that
+        # result rather than re-running it — the file is never recreated. Deleting
+        # it on failure turned every retry into FileNotFoundError, masking the
+        # original error. Upserts are keyed by chunk id, so re-running from the
+        # start is idempotent.
+        raise
+    else:
         try:
             Path(temp_path).unlink(missing_ok=True)
         except OSError:
