@@ -2,7 +2,7 @@
 
 Ask plain-English questions about any GitHub repo and get answers grounded in the code with file-path + line-number citations. The agent runs vector search over chunks of the repo, then a ReAct loop to assemble the answer.
 
-**Live:** [repomind.vercel.app](https://repomind.vercel.app)
+**Live:** [repomind-tusharbhatt.vercel.app](https://repomind-tusharbhatt.vercel.app)
 **Architecture deep-dive:** [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 
 ---
