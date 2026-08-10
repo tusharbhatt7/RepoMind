@@ -557,18 +557,24 @@ export function Sidebar() {
         {/* Model info pill */}
         <div className="flex items-center gap-2 px-2 py-1.5 rounded-lg bg-white/[0.03] border border-white/[0.05] mb-2">
           <Cpu className="w-3 h-3 text-white/30 shrink-0" />
-          <span className="text-[10px] text-white/30 truncate">Qwen2.5-7B · Modal GPU</span>
+          <span className="text-[10px] text-white/30 truncate">
+            {process.env.NEXT_PUBLIC_MODEL_LABEL ?? "Gemini 2.5 Flash"}
+          </span>
         </div>
 
-        <a
-          href="http://localhost:8288"
-          target="_blank"
-          rel="noreferrer"
-          className="flex items-center gap-1.5 px-2 py-1.5 rounded-lg text-[10px] text-white/30 hover:text-sky-400 hover:bg-sky-500/5 transition-all"
-        >
-          <ExternalLink className="w-3 h-3 shrink-0" />
-          <span>Inngest Dev UI</span>
-        </a>
+        {/* Dev-only: the Inngest dev server runs on localhost, so this link is
+            dead for anyone visiting a deployed build. */}
+        {process.env.NODE_ENV === "development" && (
+          <a
+            href="http://localhost:8288"
+            target="_blank"
+            rel="noreferrer"
+            className="flex items-center gap-1.5 px-2 py-1.5 rounded-lg text-[10px] text-white/30 hover:text-sky-400 hover:bg-sky-500/5 transition-all"
+          >
+            <ExternalLink className="w-3 h-3 shrink-0" />
+            <span>Inngest Dev UI</span>
+          </a>
+        )}
       </div>
     </aside>
   );
